@@ -80,30 +80,48 @@
           }
         }
 
-        const websocket = new WebSocket(`wss://${host}/graphql`, [
-          'graphql-ws',
-        ])
-        websocket.onopen = function () {
-          log('Trying to connect...')
-          websocket.send('{"type":"connection_init","payload":{}}')
-          websocket.send(`{"id":"1","type":"start","payload":{"variables":{},"extensions":{},"operationName":null,"query":"${query}"}}`)
-        }
-        websocket.onclose = function () {
-          log('DISCONNECTED')
-        }
-        websocket.onmessage = function (event) {
-          const data = JSON.parse(event.data)
-          if (data.type === 'data') {
-            log(logTemplate(
-              network,
-              data.payload.data.blocks,
-            ))
-            up(data.payload.data.blocks)
+        const connect = (url) => {
+          const start = Date.now()
+          let dataCount = 0
+          let dataEmptyCount = 0
+          const websocket = new WebSocket(url, [
+            'graphql-ws',
+          ])
+          websocket.onopen = function() {
+            log('Trying to connect...')
+            websocket.send('{"type":"connection_init","payload":{}}')
+            websocket.send(`{"id":"1","type":"start","payload":{"variables":{},"extensions":{},"operationName":null,"query":"${query}"}}`)
+          }
+          websocket.onclose = function() {
+            log('Disconnected, reconnect will be attempted in 5 second...')
+            setTimeout(function() {
+              connect(url)
+            }, 5000)
+          }
+          websocket.onmessage = function(event) {
+            const count = 1 / dataEmptyCount * dataCount
+            const data = JSON.parse(event.data)
+            if (data.type === 'data') {
+              dataCount += 1
+              log(logTemplate(
+                network,
+                data.payload.data.blocks,
+              ))
+              up(data.payload.data.blocks)
+            } else {
+              dataEmptyCount += 1
+            }
+
+            if (count < 1 && Date.now() - start > 10000) {
+              websocket.close()
+            }
+          }
+          websocket.onerror = function(event) {
+            log(`<span style='color: red'>ERROR:</span> ${event.data}`)
+            websocket.close()
           }
         }
-        websocket.onerror = function (event) {
-          log(`<span style='color: red'>ERROR:</span> ${event.data}`)
-        }
+        connect(`wss://${host}/graphql`)
       }
 
       function logTemplate(network, block) {
