@@ -127,6 +127,8 @@
             return `https://devnet.venomscan.com/blocks/${block.workchain_id}/${block.shard}/${block.seq_no}`
           case 'gosh-main':
             return `https://gosh.live/blocks/blockDetails?id=${block.id}`
+          case 'gosh-test':
+            return `https://ackinacki-testnet.tvmlabs.dev/blocks/blockDetails?id=${block.id}`
           case 'ever-beta':
             return `https://rfld.ever.live/blocks/blockDetails?id=${block.id}`
           case 'ever-smft':
@@ -145,10 +147,12 @@
         switch (network) {
           case 'gosh-main':
             return 'gra01.network.gosh.sh'
+          case 'gosh-test':
+            return 'ackinacki-testnet.tvmlabs.dev'
           case 'venom-main':
-            return 'gql.venom.foundation'
+            return 'venom-mainnet.tvmlabs.dev'
           case 'venom-test':
-            return `venom-testnet.evercloud.dev/${projectID}`
+            return 'venom-testnet.tvmlabs.dev'
           case 'venom-dev':
             return 'gql-devnet.venom.network'
           case 'ever-beta':
@@ -160,11 +164,9 @@
           case 'ever-test':
             return `devnet.evercloud.dev/${projectID}`
           case 'ton-main':
-            return `ton-mainnet.evercloud.dev/${projectID}`
+            return 'ton-mainnet.tvmlabs.dev'
           case 'ton-test':
-            return `ton-testnet.evercloud.dev/${projectID}`
-          case 'treeton':
-            return 'gql.treeton.org'
+            return 'ton-testnet.tvmlabs.dev'
           default:
             return `${network}.evercloud.dev/${projectID}`
         }
@@ -174,6 +176,8 @@
         switch (network) {
           case 'gosh-main':
             return 'GOSH'
+          case 'gosh-test':
+            return 'GOSH Testnet (Acki Nacki)'
           case 'venom-main':
             return 'VENOM Mainnet'
           case 'venom-test':
@@ -202,17 +206,14 @@
       window.addEventListener('load', function () {
         const root = document.querySelector('[data-behavior=content]')
         const query = 'subscription {blocks {id tr_count workchain_id seq_no shard gen_software_version}}'
-        // subscription(root, 'treeton', query)
         subscription(root, 'ever-main', query)
         subscription(root, 'ever-test', query)
-        subscription(root, 'ever-beta', query)
-        // subscription(root, 'ever-smft', query)
         subscription(root, 'venom-main', query)
         subscription(root, 'venom-test', query)
-        subscription(root, 'venom-dev', query)
         subscription(root, 'ton-main', query)
         subscription(root, 'ton-test', query)
         subscription(root, 'gosh-main', query)
+        subscription(root, 'gosh-test', query)
       })
     </script>
 </head>
