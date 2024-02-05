@@ -145,20 +145,16 @@
       function graphqlHost(network) {
         const projectID = 'a3446bfb5e4e4f2a84d68400a28d990e'
         switch (network) {
+          case 'ackinacki-test':
+            return 'ackinacki-testnet.tvmlabs.dev'
           case 'gosh-main':
             return 'gra01.network.gosh.sh'
-          case 'gosh-test':
-            return 'ackinacki-testnet.tvmlabs.dev'
           case 'venom-main':
             return 'venom-mainnet.tvmlabs.dev'
           case 'venom-test':
             return 'venom-testnet.tvmlabs.dev'
           case 'venom-dev':
             return 'gql-devnet.venom.network'
-          case 'ever-beta':
-            return 'rfld-dapp.itgold.io'
-          case 'ever-smft':
-            return 'dapp-smft.itgold.io'
           case 'ever-main':
             return `mainnet.evercloud.dev/${projectID}`
           case 'ever-test':
@@ -174,20 +170,16 @@
 
       function name(network) {
         switch (network) {
+          case 'ackinacki-test':
+            return 'Acki Nacki Testnet'
           case 'gosh-main':
-            return 'GOSH'
-          case 'gosh-test':
-            return 'GOSH Testnet (Acki Nacki)'
+            return 'Gosh Mainnet'
           case 'venom-main':
-            return 'VENOM Mainnet'
+            return 'Venom Mainnet'
           case 'venom-test':
-            return 'VENOM Testnet'
+            return 'Venom Testnet'
           case 'venom-dev':
             return 'VENOM Devnet'
-          case 'ever-beta':
-            return 'Everscale RFLD Devnet'
-          case 'ever-smft':
-            return 'Everscale SMFT Devnet'
           case 'ever-main':
             return 'Everscale Mainnet'
           case 'ever-test':
@@ -196,8 +188,6 @@
             return 'TON Mainnet'
           case 'ton-test':
             return 'TON Testnet'
-          case 'treeton':
-            return 'Treeton'
           default:
             return network
         }
@@ -213,7 +203,7 @@
         subscription(root, 'ton-main', query)
         subscription(root, 'ton-test', query)
         subscription(root, 'gosh-main', query)
-        subscription(root, 'gosh-test', query)
+        subscription(root, 'ackinacki-test', query)
       })
     </script>
 </head>
