@@ -152,9 +152,9 @@
           case 'ever-smft':
             return `https://smft.ever.live/blocks/blockDetails?id=${block.id}`
           case 'ton-main':
-            return `https://ton.cx/block/${block.workchain_id}:${block.shard}:${block.seq_no}`
+            return `https://tonscan.org/block/${block.workchain_id}:${block.shard}:${block.seq_no}`
           case 'ton-test':
-            return `https://testnet.ton.cx/block/${block.workchain_id}:${block.shard}:${block.seq_no}`
+            return `https://testnet.tonscan.org/block/${block.workchain_id}:${block.shard}:${block.seq_no}`
           default:
             return null
         }
