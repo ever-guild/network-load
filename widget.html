@@ -34,11 +34,17 @@
       function createMetric(network) {
         const out = document.createElement('div')
         out.className = 'metric'
+        let extra = ''
+        if (!network.includes('ackinacki')) {
+            extra += '<span>(MC: <span data-behavior="tpsMC">...</span></span>'
+            extra += '<span> WC: <span data-behavior="tpsWC0">...</span>)</span>'
+        }
         out.innerHTML = `<h3>${name(network)}</h3>
-<h4><span> BPS: <span data-behavior='bps'>...</span><span>
-<span> TPS: <span data-behavior='tps'>...</span><span>
-<span>(MC: <span data-behavior='tpsMC'>...</span>
-<span> WC: <span data-behavior='tpsWC0'>...</span>)</h4>
+<h4>
+ <span> BPS: <span data-behavior='bps'>...</span><span>
+ <span> TPS: <span data-behavior='tps'>...</span><span>
+ ${extra}
+</h4>
 <div data-behavior='output'></div>`
         out.updateElem = (name, value) => {
           out.querySelector(`[data-behavior=${name}]`).innerHTML = value
@@ -75,8 +81,10 @@
           if (timeDiff > 10000) {
             metric.updateElem('bps', `${BPS.toFixed(1)}`)
             metric.updateElem('tps', `${TPS.toFixed(1)}`)
-            metric.updateElem('tpsMC', `${TPSMC.toFixed(2)}`)
-            metric.updateElem('tpsWC0', `${TPSMWC0 >= 0 ? TPSMWC0.toFixed(2) : '...'}`)
+            if (TPSMC) {
+              metric.updateElem('tpsMC', `${TPSMC.toFixed(2)}`)
+              metric.updateElem('tpsWC0', `${TPSMWC0 >= 0 ? TPSMWC0.toFixed(2) : '...'}`)
+            }
           }
         }
 
@@ -126,7 +134,10 @@
 
       function logTemplate(network, block) {
         const url = urlBlock(network, block)
-        const content = `${block.workchain_id}:${block.shard.slice(0, 2)}:${block.seq_no}|v${block.gen_software_version}`
+        let content = `${block.workchain_id}:${block.shard.slice(0, 2)}:${block.seq_no}`
+        if (block.gen_software_version) {
+          content += `|v${block.gen_software_version}`
+        }
         if (url) {
           return `<span><a target="_blank" href="${url}">${content}</a></span>`
         }
@@ -135,6 +146,8 @@
 
       function urlBlock(network, block) {
         switch (network) {
+          case 'ackinacki-test':
+            return `https://ackinacki-testnet.tvmlabs.dev/blocks/blockDetails?id=${block.id}`
           case 'ever-main':
             return `https://everscan.io/blocks/${block.workchain_id}/${block.shard}/${block.seq_no}`
           case 'ever-test':
