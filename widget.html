@@ -152,6 +152,8 @@
             return `https://everscan.io/blocks/${block.workchain_id}/${block.shard}/${block.seq_no}`
           case 'ever-test':
             return `https://testnet.everscan.io/blocks/${block.workchain_id}/${block.shard}/${block.seq_no}`
+          case 'venom-main':
+            return `https://venomscan.com/blocks/${block.workchain_id}/${block.shard}/${block.seq_no}`
           case 'venom-test':
             return `https://testnet.venomscan.com/blocks/${block.workchain_id}/${block.shard}/${block.seq_no}`
           case 'venom-dev':
