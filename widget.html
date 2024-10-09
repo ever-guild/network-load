@@ -169,8 +169,6 @@
             return `https://venomscan.com/blocks/${block.workchain_id}/${block.shard}/${block.seq_no}`
           case 'venom-test':
             return `https://testnet.venomscan.com/blocks/${block.workchain_id}/${block.shard}/${block.seq_no}`
-          case 'venom-dev':
-            return `https://devnet.venomscan.com/blocks/${block.workchain_id}/${block.shard}/${block.seq_no}`
           case 'gosh-main':
             return `https://gosh.live/blocks/blockDetails?id=${block.id}`
           case 'gosh-test':
@@ -201,8 +199,6 @@
             return 'venom-mainnet.tvmlabs.dev'
           case 'venom-test':
             return 'venom-testnet.tvmlabs.dev'
-          case 'venom-dev':
-            return 'gql-devnet.venom.network'
           case 'ever-main':
             return `mainnet.evercloud.dev/${projectID}`
           case 'ever-test':
@@ -228,12 +224,10 @@
             return 'Venom Mainnet'
           case 'venom-test':
             return 'Venom Testnet'
-          case 'venom-dev':
-            return 'VENOM Devnet'
           case 'ever-main':
             return 'Everscale Mainnet'
           case 'ever-test':
-            return 'Everscale Devnet'
+            return 'Everscale Testnet'
           case 'ton-main':
             return 'TON Mainnet'
           case 'ton-test':
