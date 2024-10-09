@@ -31,7 +31,39 @@
     <script>
       const u8 = (value) => BigInt.asUintN(8, BigInt(value)).toString(16)
 
-      function createMetric(network) {
+      function metricUpdate(elem) {
+        let startTime
+        let totalTransactionCount = 0
+        let totalBlockCount = 0
+        const wcCount = {}
+
+        return (block) => {
+          const transactionCount = block.tr_count
+          const workchainId = u8(block.workchain_id)
+          wcCount[workchainId] = (wcCount[workchainId] || 0) + transactionCount
+          const nowTime = Date.now()
+          if (!startTime) {
+            startTime = Date.now()
+          }
+          totalTransactionCount += transactionCount
+          totalBlockCount += 1
+          const timeDiff = nowTime - startTime
+          const BPS = Number(totalBlockCount / timeDiff * 1000)
+          const TPS = Number(totalTransactionCount / timeDiff * 1000)
+          const TPSMC = Number(wcCount['ff'] / timeDiff * 1000)
+          const TPSMWC0 = Number(wcCount['0'] / timeDiff * 1000)
+          if (timeDiff > 10000) {
+            elem.updateElem('bps', `${BPS.toFixed(1)}`)
+            elem.updateElem('tps', `${TPS.toFixed(1)}`)
+            if (TPSMC) {
+              elem.updateElem('tpsMC', `${TPSMC.toFixed(2)}`)
+              elem.updateElem('tpsWC0', `${TPSMWC0 >= 0 ? TPSMWC0.toFixed(2) : '...'}`)
+            }
+          }
+        }
+      }
+
+      function createMetric(root, network) {
         const out = document.createElement('div')
         out.className = 'metric'
         let extra = ''
@@ -49,45 +81,26 @@
         out.updateElem = (name, value) => {
           out.querySelector(`[data-behavior=${name}]`).innerHTML = value
         }
-        return out
+        root.append(out)
+        return {
+          up: metricUpdate(out),
+          log: (message) => out.updateElem('output', message),
+        }
       }
 
-      function subscription(root, network, query) {
-        const host = graphqlHost(network)
-        const metric = createMetric(network)
-        root.append(metric)
-        const log = (message) => metric.updateElem('output', message)
+      function blockPollingEverX(root, network) {
+        // TODO implement
+        console.log(`${network} not implement`)
+      }
 
-        let startTime
-        let totalTransactionCount = 0
-        let totalBlockCount = 0
-        const wcCount = {}
+      function blockPollingTonCore(root, network) {
+        // TODO implement
+        console.log(`${network} not implement`)
+      }
 
-        function up(block) {
-          const transactionCount = block.tr_count
-          const workchainId = u8(block.workchain_id)
-          wcCount[workchainId] = (wcCount[workchainId] || 0) + transactionCount
-          const nowTime = Date.now()
-          if (!startTime) {
-            startTime = Date.now()
-          }
-          totalTransactionCount += transactionCount
-          totalBlockCount += 1
-          const timeDiff = nowTime - startTime
-          const BPS = Number(totalBlockCount / timeDiff * 1000)
-          const TPS = Number(totalTransactionCount / timeDiff * 1000)
-          const TPSMC = Number(wcCount['ff'] / timeDiff * 1000)
-          const TPSMWC0 = Number(wcCount['0'] / timeDiff * 1000)
-          if (timeDiff > 10000) {
-            metric.updateElem('bps', `${BPS.toFixed(1)}`)
-            metric.updateElem('tps', `${TPS.toFixed(1)}`)
-            if (TPSMC) {
-              metric.updateElem('tpsMC', `${TPSMC.toFixed(2)}`)
-              metric.updateElem('tpsWC0', `${TPSMWC0 >= 0 ? TPSMWC0.toFixed(2) : '...'}`)
-            }
-          }
-        }
-
+      function blockSubscriptionEverX(root, network) {
+        const query = 'subscription {blocks {id tr_count workchain_id seq_no shard gen_software_version}}'
+        const {up, log} = createMetric(root, network)
         const connect = (url) => {
           const start = Date.now()
           let dataCount = 0
@@ -111,11 +124,9 @@
             const data = JSON.parse(event.data)
             if (data.type === 'data') {
               dataCount += 1
-              log(logTemplate(
-                network,
-                data.payload.data.blocks,
-              ))
-              up(data.payload.data.blocks)
+              const block = data.payload.data.blocks
+              log(logTemplate(network, block))
+              up(block)
             } else {
               dataEmptyCount += 1
             }
@@ -129,7 +140,7 @@
             websocket.close()
           }
         }
-        connect(`wss://${host}/graphql`)
+        connect(`wss://${graphqlHost(network)}/graphql`)
       }
 
       function logTemplate(network, block) {
@@ -146,6 +157,8 @@
 
       function urlBlock(network, block) {
         switch (network) {
+          case 'shellnet-test':
+            return `https://shellnet.ackinacki.org/blocks/blockDetails?id=${block.id}`
           case 'ackinacki-test':
             return `https://ackinacki-testnet.tvmlabs.dev/blocks/blockDetails?id=${block.id}`
           case 'ever-main':
@@ -178,6 +191,8 @@
       function graphqlHost(network) {
         const projectID = 'a3446bfb5e4e4f2a84d68400a28d990e'
         switch (network) {
+          case 'shellnet-test':
+            return 'shellnet.ackinacki.org'
           case 'ackinacki-test':
             return 'ackinacki-testnet.tvmlabs.dev'
           case 'gosh-main':
@@ -203,8 +218,10 @@
 
       function name(network) {
         switch (network) {
+          case 'shellnet-test':
+            return 'Acki Nacki Testnet (beta)'
           case 'ackinacki-test':
-            return 'Acki Nacki Testnet'
+            return 'Acki Nacki Testnet (alpha)'
           case 'gosh-main':
             return 'Gosh Mainnet'
           case 'venom-main':
@@ -226,17 +243,32 @@
         }
       }
 
+      function loadWidget(elem, network) {
+        switch (network) {
+          case 'venom-test':
+          case 'shellnet-test':
+            blockPollingEverX(elem, network)
+            break
+          case 'ton-main':
+          case 'ton-test':
+            blockPollingTonCore(elem, network)
+            break
+          default:
+            blockSubscriptionEverX(elem, network)
+        }
+      }
+
       window.addEventListener('load', function () {
         const root = document.querySelector('[data-behavior=content]')
-        const query = 'subscription {blocks {id tr_count workchain_id seq_no shard gen_software_version}}'
-        subscription(root, 'ever-main', query)
-        subscription(root, 'ever-test', query)
-        subscription(root, 'venom-main', query)
-        subscription(root, 'venom-test', query)
-        subscription(root, 'ton-main', query)
-        subscription(root, 'ton-test', query)
-        subscription(root, 'gosh-main', query)
-        subscription(root, 'ackinacki-test', query)
+        loadWidget(root, 'ever-main')
+        loadWidget(root, 'ever-test')
+        loadWidget(root, 'venom-main')
+        loadWidget(root, 'venom-test')
+        loadWidget(root, 'ton-main')
+        loadWidget(root, 'ton-test')
+        loadWidget(root, 'gosh-main')
+        loadWidget(root, 'ackinacki-test')
+        loadWidget(root, 'shellnet-test')
       })
     </script>
 </head>
