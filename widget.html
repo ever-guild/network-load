@@ -83,14 +83,198 @@
         }
         root.append(out)
         return {
+          elem: out,
           up: metricUpdate(out),
           log: (message) => out.updateElem('output', message),
         }
       }
 
-      function blockPollingEverX(root, network) {
-        // TODO implement
-        console.log(`${network} not implement`)
+      function startLongPolling({ intervalMs = 1500, fetchOnce, normalize, onBatch, onError, onLog }) {
+        let stopped = false
+        async function tick() {
+          if (stopped) return
+          try {
+            const raw = await fetchOnce()
+            const normalized = normalize(raw)
+            await onBatch(normalized, raw)
+          } catch (e) {
+            if (onError) onError(e)
+          } finally {
+            if (!stopped) setTimeout(tick, intervalMs)
+          }
+        }
+        if (onLog) onLog('Starting long-poll...')
+        tick()
+        return { stop: () => { stopped = true } }
+      }
+
+      function createMetricsAggregator(elem, options = {}) {
+        const retentionMs = options.retentionMs || 5 * 60 * 1000 // keep ids for 5 minutes
+        let startTime
+        let totalTransactionCount = 0
+        let totalBlockCount = 0
+        const wcTransactionCount = {}
+        const seenTx = new Map() // id -> lastSeenTs
+        const seenBlocks = new Map() // id -> { ts, workchain_id }
+
+        function prune(now) {
+          for (const [id, ts] of seenTx) {
+            if (now - ts > retentionMs) seenTx.delete(id)
+          }
+          for (const [id, meta] of seenBlocks) {
+            if (now - meta.ts > retentionMs) seenBlocks.delete(id)
+          }
+        }
+
+        function ingest({ blocks = [], transactions = [] }) {
+          const now = Date.now()
+          if (!startTime) startTime = now
+
+          let newBlocks = 0
+          let newTxs = 0
+
+          for (const b of blocks) {
+            if (!b || !b.id) continue
+            if (!seenBlocks.has(b.id)) {
+              seenBlocks.set(b.id, { ts: now, workchain_id: b.workchain_id })
+              newBlocks += 1
+              if (typeof b.tr_count === 'number') {
+                totalTransactionCount += b.tr_count
+                if (b.workchain_id !== undefined) {
+                  const wc = u8(b.workchain_id)
+                  wcTransactionCount[wc] = (wcTransactionCount[wc] || 0) + b.tr_count
+                }
+              }
+            } else {
+              const meta = seenBlocks.get(b.id)
+              meta.ts = now
+              seenBlocks.set(b.id, meta)
+            }
+          }
+          for (const t of transactions) {
+            if (!t || !t.id) continue
+            if (!seenTx.has(t.id)) {
+              seenTx.set(t.id, now)
+              newTxs += 1
+              totalTransactionCount += 1
+              if (t.block_id) {
+                if (!seenBlocks.has(t.block_id)) {
+                  seenBlocks.set(t.block_id, { ts: now })
+                  newBlocks += 1
+                } else {
+                  const meta = seenBlocks.get(t.block_id)
+                  if (meta) { meta.ts = now; seenBlocks.set(t.block_id, meta) }
+                }
+              }
+            } else {
+              seenTx.set(t.id, now)
+            }
+          }
+
+          totalBlockCount += newBlocks
+          prune(now)
+
+          const timeDiff = now - startTime
+          if (timeDiff > 1000) {
+            const BPS = Number(totalBlockCount / timeDiff * 1000)
+            const TPS = Number(totalTransactionCount / timeDiff * 1000)
+            const TPSMC = wcTransactionCount['ff'] ? Number(wcTransactionCount['ff'] / timeDiff * 1000) : undefined
+            const TPSWC0 = wcTransactionCount['0'] !== undefined ? Number(wcTransactionCount['0'] / timeDiff * 1000) : undefined
+
+            elem.updateElem('bps', `${BPS.toFixed(1)}`)
+            elem.updateElem('tps', `${TPS.toFixed(1)}`)
+            if (TPSMC !== undefined) {
+              elem.updateElem('tpsMC', `${TPSMC.toFixed(2)}`)
+              elem.updateElem('tpsWC0', `${TPSWC0 >= 0 ? TPSWC0.toFixed(2) : '...'}`)
+            }
+          }
+
+          return { newBlocks, newTxs }
+        }
+
+        return { ingest }
+      }
+
+      function notImplemented(root, network) {
+        const { log } = createMetric(root, network)
+        log(`<span style='color: red'>ERROR:</span> not impliment ${network}`)
+      }
+
+      function blockPolling(root, network) {
+        const { elem, log } = createMetric(root, network)
+        const aggregator = createMetricsAggregator(elem)
+        const host = graphqlHost(network)
+        const query = `query { blockchain { blocks( last: 500 ) { edges { node { hash seq_no workchain_id shard gen_utime tr_count gen_software_version } cursor } pageInfo{ endCursor } } } }`
+        const makeUrl = () => `https://${host}/graphql?_=_&isBlockChainApiQuery=true&query=${encodeURIComponent(query)}`
+        const fetchOnce = async () => {
+          const res = await fetch(makeUrl(), { method: 'GET', cache: 'no-store' })
+          if (!res.ok) throw new Error(`HTTP ${res.status}`)
+          return res.json()
+        }
+
+        const normalize = (response) => {
+          const edges = (((response || {}).data || {}).blockchain || {}).blocks || {}
+          const list = Array.isArray(edges.edges) ? edges.edges : []
+          const blocks = list.map(e => e && e.node).filter(Boolean).map(n => ({
+            id: n.hash,
+            tr_count: n.tr_count,
+            workchain_id: n.workchain_id,
+            seq_no: n.seq_no,
+            shard: n.shard,
+            gen_software_version: n.gen_software_version,
+          }))
+          return { blocks, transactions: [] }
+        }
+
+        const onBatch = (normalized, raw) => {
+          aggregator.ingest(normalized)
+
+          // Always display latest block link using logTemplate
+          let latest = null
+
+          // Prefer normalized blocks list
+          if (normalized && Array.isArray(normalized.blocks) && normalized.blocks.length > 0) {
+            latest = normalized.blocks.reduce((acc, b) => {
+              if (!acc) return b
+              if (typeof b.seq_no === 'number' && typeof acc.seq_no === 'number') {
+                return b.seq_no > acc.seq_no ? b : acc
+              }
+              return b || acc
+            }, null)
+          }
+
+          // Fallback to raw edges if needed
+          if (!latest) {
+            const blocksNode = ((((raw || {}).data || {}).blockchain || {}).blocks) || {}
+            const edges = Array.isArray(blocksNode.edges) ? blocksNode.edges : []
+            if (edges.length > 0) {
+              const latestNode = edges.reduce((acc, e) => {
+                const n = e && e.node
+                if (!n) return acc
+                if (!acc || (typeof n.seq_no === 'number' && n.seq_no > acc.seq_no)) return n
+                return acc
+              }, null)
+              if (latestNode) {
+                latest = {
+                  id: latestNode.hash,
+                  workchain_id: latestNode.workchain_id,
+                  shard: latestNode.shard,
+                  seq_no: latestNode.seq_no,
+                  gen_software_version: latestNode.gen_software_version,
+                }
+              }
+            }
+          }
+
+          if (latest) {
+            log(logTemplate(network, latest))
+          }
+        }
+
+        const onError = (e) => {
+          log(`<span style='color: red'>ERROR:</span> ${e.message || e}`)
+        }
+        startLongPolling({ intervalMs: 1500, fetchOnce, normalize, onBatch, onError, onLog: log })
       }
 
       function blockPollingTonCore(root, network) {
@@ -144,10 +328,13 @@
       }
 
       function logTemplate(network, block) {
-        const url = urlBlock(network, block)
+        const url = explorerBlock(network, block)
         let content = `${block.workchain_id}:${block.shard.slice(0, 2)}:${block.seq_no}`
         if (block.gen_software_version) {
           content += `|v${block.gen_software_version}`
+        }
+        if (network.includes('ackinacki')) {
+          content = `${block.seq_no}`
         }
         if (url) {
           return `<span><a target="_blank" href="${url}">${content}</a></span>`
@@ -155,12 +342,12 @@
         return `<span>${content}</span>`
       }
 
-      function urlBlock(network, block) {
+      function explorerBlock(network, block) {
         switch (network) {
-          case 'shellnet-test':
+          case 'ackinacki-mainnet':
+            return `https://mainnet.ackinacki.org/blocks/blockDetails?id=${block.id}`
+          case 'ackinacki-shellnet':
             return `https://shellnet.ackinacki.org/blocks/blockDetails?id=${block.id}`
-          case 'ackinacki-test':
-            return `https://ackinacki-testnet.tvmlabs.dev/blocks/blockDetails?id=${block.id}`
           case 'ever-main':
             return `https://everscan.io/blocks/${block.workchain_id}/${block.shard}/${block.seq_no}`
           case 'ever-test':
@@ -189,10 +376,10 @@
       function graphqlHost(network) {
         const projectID = 'a3446bfb5e4e4f2a84d68400a28d990e'
         switch (network) {
-          case 'shellnet-test':
+          case 'ackinacki-shellnet':
             return 'shellnet.ackinacki.org'
-          case 'ackinacki-test':
-            return 'ackinacki-testnet.tvmlabs.dev'
+          case 'ackinacki-mainnet':
+            return 'mainnet.ackinacki.org'
           case 'gosh-main':
             return 'gra01.network.gosh.sh'
           case 'venom-main':
@@ -214,10 +401,10 @@
 
       function name(network) {
         switch (network) {
-          case 'shellnet-test':
-            return 'Acki Nacki Testnet (beta)'
-          case 'ackinacki-test':
-            return 'Acki Nacki Testnet (alpha)'
+          case 'ackinacki-shellnet':
+            return 'Acki Nacki Testnet'
+          case 'ackinacki-mainnet':
+            return 'Acki Nacki Mainnet'
           case 'gosh-main':
             return 'Gosh Mainnet'
           case 'venom-main':
@@ -239,30 +426,35 @@
 
       function loadWidget(elem, network) {
         switch (network) {
-          case 'venom-test':
-          case 'shellnet-test':
-            blockPollingEverX(elem, network)
+          case 'ackinacki-shellnet':
+          case 'ackinacki-mainnet':
+            blockPolling(elem, network)
             break
           case 'ton-main':
           case 'ton-test':
             blockPollingTonCore(elem, network)
             break
-          default:
+          case 'ever-main':
+          case 'ever-test':
+          case 'venom-main':
+          case 'venom-test':
             blockSubscriptionEverX(elem, network)
+            break
+          default:
+            notImplemented(elem, network)
         }
       }
 
       window.addEventListener('load', function () {
         const root = document.querySelector('[data-behavior=content]')
         loadWidget(root, 'ever-main')
-        loadWidget(root, 'ever-test')
+        // loadWidget(root, 'ever-test')
         loadWidget(root, 'venom-main')
-        loadWidget(root, 'venom-test')
-        loadWidget(root, 'ton-main')
-        loadWidget(root, 'ton-test')
-        loadWidget(root, 'gosh-main')
-        loadWidget(root, 'ackinacki-test')
-        loadWidget(root, 'shellnet-test')
+        // loadWidget(root, 'venom-test')
+        loadWidget(root, 'ackinacki-mainnet')
+        loadWidget(root, 'ackinacki-shellnet')
+        // loadWidget(root, 'ton-main')
+        // loadWidget(root, 'ton-test')
       })
     </script>
 </head>
