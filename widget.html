@@ -108,36 +108,40 @@
         return { stop: () => { stopped = true } }
       }
 
-      function createMetricsAggregator(elem, options = {}) {
+      function createPollingMetricsAggregator(elem, options = {}) {
         const retentionMs = options.retentionMs || 5 * 60 * 1000 // keep ids for 5 minutes
-        let startTime
+        let firstBlockTime
+        let lastBlockTime
         let totalTransactionCount = 0
         let totalBlockCount = 0
         const wcTransactionCount = {}
-        const seenTx = new Map() // id -> lastSeenTs
-        const seenBlocks = new Map() // id -> { ts, workchain_id }
+        const seenBlocks = new Map()
 
         function prune(now) {
-          for (const [id, ts] of seenTx) {
-            if (now - ts > retentionMs) seenTx.delete(id)
-          }
           for (const [id, meta] of seenBlocks) {
-            if (now - meta.ts > retentionMs) seenBlocks.delete(id)
+            if (now - meta.gen_utime * 1000 > retentionMs) seenBlocks.delete(id)
           }
         }
 
         function ingest({ blocks = [], transactions = [] }) {
           const now = Date.now()
-          if (!startTime) startTime = now
-
           let newBlocks = 0
-          let newTxs = 0
 
           for (const b of blocks) {
-            if (!b || !b.id) continue
+            if (!b || !b.id || typeof b.gen_utime !== 'number') continue
+            
             if (!seenBlocks.has(b.id)) {
-              seenBlocks.set(b.id, { ts: now, workchain_id: b.workchain_id })
+              seenBlocks.set(b.id, { gen_utime: b.gen_utime, workchain_id: b.workchain_id })
               newBlocks += 1
+              
+              // Track time range
+              if (!firstBlockTime || b.gen_utime < firstBlockTime) {
+                firstBlockTime = b.gen_utime
+              }
+              if (!lastBlockTime || b.gen_utime > lastBlockTime) {
+                lastBlockTime = b.gen_utime
+              }
+              
               if (typeof b.tr_count === 'number') {
                 totalTransactionCount += b.tr_count
                 if (b.workchain_id !== undefined) {
@@ -145,51 +149,31 @@
                   wcTransactionCount[wc] = (wcTransactionCount[wc] || 0) + b.tr_count
                 }
               }
-            } else {
-              const meta = seenBlocks.get(b.id)
-              meta.ts = now
-              seenBlocks.set(b.id, meta)
-            }
-          }
-          for (const t of transactions) {
-            if (!t || !t.id) continue
-            if (!seenTx.has(t.id)) {
-              seenTx.set(t.id, now)
-              newTxs += 1
-              totalTransactionCount += 1
-              if (t.block_id) {
-                if (!seenBlocks.has(t.block_id)) {
-                  seenBlocks.set(t.block_id, { ts: now })
-                  newBlocks += 1
-                } else {
-                  const meta = seenBlocks.get(t.block_id)
-                  if (meta) { meta.ts = now; seenBlocks.set(t.block_id, meta) }
-                }
-              }
-            } else {
-              seenTx.set(t.id, now)
             }
           }
 
           totalBlockCount += newBlocks
           prune(now)
 
-          const timeDiff = now - startTime
-          if (timeDiff > 1000) {
-            const BPS = Number(totalBlockCount / timeDiff * 1000)
-            const TPS = Number(totalTransactionCount / timeDiff * 1000)
-            const TPSMC = wcTransactionCount['ff'] ? Number(wcTransactionCount['ff'] / timeDiff * 1000) : undefined
-            const TPSWC0 = wcTransactionCount['0'] !== undefined ? Number(wcTransactionCount['0'] / timeDiff * 1000) : undefined
+          // Calculate metrics based on block time range, not client time
+          if (firstBlockTime && lastBlockTime && lastBlockTime > firstBlockTime) {
+            const timeDiffSeconds = lastBlockTime - firstBlockTime
+            if (timeDiffSeconds > 1) {
+              const BPS = Number(totalBlockCount / timeDiffSeconds)
+              const TPS = Number(totalTransactionCount / timeDiffSeconds)
+              const TPSMC = wcTransactionCount['ff'] ? Number(wcTransactionCount['ff'] / timeDiffSeconds) : undefined
+              const TPSWC0 = wcTransactionCount['0'] !== undefined ? Number(wcTransactionCount['0'] / timeDiffSeconds) : undefined
 
-            elem.updateElem('bps', `${BPS.toFixed(1)}`)
-            elem.updateElem('tps', `${TPS.toFixed(1)}`)
-            if (TPSMC !== undefined) {
-              elem.updateElem('tpsMC', `${TPSMC.toFixed(2)}`)
-              elem.updateElem('tpsWC0', `${TPSWC0 >= 0 ? TPSWC0.toFixed(2) : '...'}`)
+              elem.updateElem('bps', `${BPS.toFixed(1)}`)
+              elem.updateElem('tps', `${TPS.toFixed(1)}`)
+              if (TPSMC !== undefined) {
+                elem.updateElem('tpsMC', `${TPSMC.toFixed(2)}`)
+                elem.updateElem('tpsWC0', `${TPSWC0 >= 0 ? TPSWC0.toFixed(2) : '...'}`)
+              }
             }
           }
 
-          return { newBlocks, newTxs }
+          return { newBlocks, newTxs: 0 }
         }
 
         return { ingest }
@@ -202,7 +186,7 @@
 
       function blockPolling(root, network) {
         const { elem, log } = createMetric(root, network)
-        const aggregator = createMetricsAggregator(elem)
+        const aggregator = createPollingMetricsAggregator(elem)
         const host = graphqlHost(network)
         const query = `query { blockchain { blocks( last: 500 ) { edges { node { hash seq_no workchain_id shard gen_utime tr_count gen_software_version } cursor } pageInfo{ endCursor } } } }`
         const makeUrl = () => `https://${host}/graphql?_=_&isBlockChainApiQuery=true&query=${encodeURIComponent(query)}`
@@ -221,6 +205,7 @@
             workchain_id: n.workchain_id,
             seq_no: n.seq_no,
             shard: n.shard,
+            gen_utime: n.gen_utime,
             gen_software_version: n.gen_software_version,
           }))
           return { blocks, transactions: [] }
