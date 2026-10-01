@@ -72,6 +72,7 @@ for (const [name, alter, message] of [
   ['stale head', p => { p.data.blocks = [{ ...block, gen_utime: now / 1000 - 31 }] }, /stale/],
   ['future head', p => { p.data.blocks = [{ ...block, gen_utime: now / 1000 + 31 }] }, /clock/],
   ['invalid block fields', p => { p.data.blocks = [{ ...block, shard: '<script>' }] }, /Invalid.*block/],
+  ['invalid software version', p => { p.data.blocks = [{ ...block, gen_software_version: '<script>' }] }, /Invalid.*block/],
   ['null transaction sum with blocks', p => { p.data.all[1] = null }, /transaction count/],
   ['missing aggregate', p => { delete p.data.mc }, /counters/],
   ['null block count', p => { p.data.all[0] = null }, /counters/],

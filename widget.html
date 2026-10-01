@@ -301,6 +301,7 @@
         if (!latest || !Number.isInteger(latest.gen_utime) ||
             typeof latest.id !== 'string' || !/^[\da-f]{64}$/i.test(latest.id) ||
             !Number.isInteger(latest.workchain_id) || !Number.isInteger(latest.seq_no) ||
+            (latest.gen_software_version != null && !Number.isSafeInteger(latest.gen_software_version)) ||
             typeof latest.shard !== 'string' || !/^[\da-f]{16}$/i.test(latest.shard)) {
           throw new Error('Invalid Everscale block response')
         }

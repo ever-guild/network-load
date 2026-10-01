@@ -34,7 +34,7 @@ no block links; `/blocks` and `/api` returned HTTP 404.
 
 The proposed [block-rpc branch](https://github.com/aagolovanov/everscale-jrpc/tree/block-rpc)
 adds `getMasterchainInfo`, `getBlockHeader`, `getShards`, and `lookupBlock`.
-Its [header model](https://github.com/aagolovanov/everscale-jrpc/blob/block-rpc/models/src/jrpc/blocks.rs)
+Its [header model](https://github.com/aagolovanov/everscale-jrpc/blob/3e321c2b75be65bc0c4b91e252c36c70dedef8a6/models/src/jrpc/blocks.rs)
 does not include a transaction count, a block transaction list, or the complete
 block BOC. `end_lt - start_lt` is not a transaction count. The upstream
 [RPC methods](https://github.com/broxus/everscale-jrpc#methods) do not provide a
