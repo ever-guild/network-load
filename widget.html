@@ -71,7 +71,10 @@
             extra += '<span>(MC: <span data-behavior="tpsMC">...</span></span>'
             extra += '<span> WC: <span data-behavior="tpsWC0">...</span>)</span>'
         }
-        out.innerHTML = `<h3>${name(network)}</h3>
+        const title = network === 'ever-main'
+          ? `<a href="https://evertx.us/" target="_blank" rel="noopener">${name(network)}</a>`
+          : name(network)
+        out.innerHTML = `<h3>${title}</h3>
 <h4>
  <span> BPS: <span data-behavior='bps'>...</span><span>
  <span> TPS: <span data-behavior='tps'>...</span><span>
@@ -267,6 +270,90 @@
         console.log(`${network} not implement`)
       }
 
+      async function fetchEverscaleLoad(now = Date.now()) {
+        // Leave 10 seconds for indexing; use one complete 60-second interval
+        // for every counter. Server aggregation includes all shards and avoids
+        // truncating busy periods to a fixed number of recent blocks.
+        const end = Math.floor(now / 1000) - 10
+        const start = end - 60
+        const timeFilter = `gen_utime: { gt: ${start}, le: ${end} }`
+        const fields = 'fields: [{ field: "id", fn: COUNT }, { field: "tr_count", fn: SUM }]'
+        const query = `query {
+          all: aggregateBlocks(filter: { ${timeFilter} }, ${fields})
+          mc: aggregateBlocks(filter: { ${timeFilter}, workchain_id: { eq: -1 } }, ${fields})
+          wc: aggregateBlocks(filter: { ${timeFilter}, workchain_id: { eq: 0 } }, ${fields})
+          blocks(limit: 1, orderBy: [{ path: "gen_utime", direction: DESC }]) {
+            id gen_utime workchain_id shard seq_no gen_software_version
+          }
+        }`
+        const response = await fetch(`https://${graphqlHost('ever-main')}/graphql`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query }),
+          cache: 'no-store',
+          signal: AbortSignal.timeout(15000),
+        })
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        const payload = await response.json()
+        if (payload.errors?.length) throw new Error('Everscale block query failed')
+        const data = payload.data
+        const latest = data?.blocks?.[0]
+        if (!latest || !Number.isInteger(latest.gen_utime) ||
+            typeof latest.id !== 'string' || !/^[\da-f]{64}$/i.test(latest.id) ||
+            !Number.isInteger(latest.workchain_id) || !Number.isInteger(latest.seq_no) ||
+            typeof latest.shard !== 'string' || !/^[\da-f]{16}$/i.test(latest.shard)) {
+          throw new Error('Invalid Everscale block response')
+        }
+        const age = now / 1000 - latest.gen_utime
+        if (age > 30 || age < -30) throw new Error('Everscale block data is stale or the local clock is incorrect')
+
+        function counts(value) {
+          const integer = n => (typeof n === 'number' || (typeof n === 'string' && /^\d+$/.test(n))) &&
+            Number.isSafeInteger(Number(n)) && Number(n) >= 0
+          if (!Array.isArray(value) || value.length !== 2 || !integer(value[0])) {
+            throw new Error('Invalid Everscale counters')
+          }
+          const blocks = Number(value[0])
+          // SUM can be null for an empty interval; missing counts are not zero.
+          const transactions = blocks === 0 && value[1] === null ? 0 : value[1]
+          if (!integer(transactions) || (blocks === 0 && Number(transactions) !== 0)) {
+            throw new Error('Invalid Everscale transaction count')
+          }
+          return { blocks, transactions: Number(transactions) }
+        }
+        const all = counts(data.all)
+        const mc = counts(data.mc)
+        const wc = counts(data.wc)
+        if (mc.blocks + wc.blocks > all.blocks || mc.transactions + wc.transactions > all.transactions) {
+          throw new Error('Inconsistent Everscale counters')
+        }
+        return {
+          latest,
+          bps: (all.blocks / 60).toFixed(1),
+          tps: (all.transactions / 60).toFixed(1),
+          tpsMC: (mc.transactions / 60).toFixed(2),
+          tpsWC0: (wc.transactions / 60).toFixed(2),
+        }
+      }
+
+      function blockPollingEverscale(root, network) {
+        const { elem, log } = createMetric(root, network)
+        startLongPolling({
+          intervalMs: 5000,
+          fetchOnce: () => fetchEverscaleLoad(),
+          normalize: value => value,
+          onBatch: snapshot => {
+            for (const key of ['bps', 'tps', 'tpsMC', 'tpsWC0']) elem.updateElem(key, snapshot[key])
+            log(logTemplate(network, snapshot.latest))
+          },
+          onError: error => {
+            for (const key of ['bps', 'tps', 'tpsMC', 'tpsWC0']) elem.updateElem(key, '...')
+            elem.querySelector('[data-behavior=output]').textContent = `ERROR: ${error.message}`
+          },
+          onLog: log,
+        })
+      }
+
       function blockSubscriptionEverX(root, network) {
         const query = 'subscription {blocks {id tr_count workchain_id seq_no shard gen_software_version}}'
         const {up, log} = createMetric(root, network)
@@ -420,6 +507,8 @@
             blockPollingTonCore(elem, network)
             break
           case 'ever-main':
+            blockPollingEverscale(elem, network)
+            break
           case 'ever-test':
           case 'venom-main':
           case 'venom-test':
