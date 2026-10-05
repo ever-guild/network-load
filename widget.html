@@ -184,82 +184,51 @@
         log(`<span style='color: red'>ERROR:</span> not impliment ${network}`)
       }
 
-      function blockPolling(root, network) {
+      function latestBlock(blocks, field) {
+        return blocks.reduce((latest, block) => !latest || block[field] > latest[field] ? block : latest, null)
+      }
+
+      function blockPolling(root, network, provider) {
         const { elem, log } = createMetric(root, network)
         const aggregator = createPollingMetricsAggregator(elem)
-        const host = graphqlHost(network)
-        const query = `query { blockchain { blocks( last: 500 ) { edges { node { hash seq_no workchain_id shard gen_utime tr_count gen_software_version } cursor } pageInfo{ endCursor } } } }`
-        const makeUrl = () => `https://${host}/graphql?_=_&isBlockChainApiQuery=true&query=${encodeURIComponent(query)}`
-        const fetchOnce = async () => {
-          const res = await fetch(makeUrl(), { method: 'GET', cache: 'no-store' })
-          if (!res.ok) throw new Error(`HTTP ${res.status}`)
-          return res.json()
+        startLongPolling({
+          intervalMs: provider.intervalMs,
+          fetchOnce: provider.fetchOnce,
+          normalize: provider.normalize,
+          onBatch: normalized => {
+            aggregator.ingest(normalized)
+            const latest = provider.onBatch ? provider.onBatch(normalized) : latestBlock(normalized.blocks, provider.latestBy)
+            if (latest) log(logTemplate(network, latest))
+          },
+          onError: error => log(`<span style='color: red'>ERROR:</span> ${error.message || error}`),
+          onLog: log,
+        })
+      }
+
+      function graphqlBlockProvider(network) {
+        const query = `query { blockchain { blocks( last: 500 ) { edges { node { hash seq_no workchain_id shard gen_utime tr_count gen_software_version } } } } }`
+        const url = `https://${graphqlHost(network)}/graphql?_=_&isBlockChainApiQuery=true&query=${encodeURIComponent(query)}`
+        return {
+          intervalMs: 1500,
+          fetchOnce: async () => {
+            const response = await fetch(url, { method: 'GET', cache: 'no-store' })
+            if (!response.ok) throw new Error(`HTTP ${response.status}`)
+            return response.json()
+          },
+          normalize: response => ({
+            blocks: (response?.data?.blockchain?.blocks?.edges || []).map(edge => edge.node).filter(Boolean).map(node => ({
+              id: node.hash,
+              tr_count: node.tr_count,
+              workchain_id: node.workchain_id,
+              seq_no: node.seq_no,
+              shard: node.shard,
+              gen_utime: node.gen_utime,
+              gen_software_version: node.gen_software_version,
+            })),
+            transactions: [],
+          }),
+          latestBy: 'seq_no',
         }
-
-        const normalize = (response) => {
-          const edges = (((response || {}).data || {}).blockchain || {}).blocks || {}
-          const list = Array.isArray(edges.edges) ? edges.edges : []
-          const blocks = list.map(e => e && e.node).filter(Boolean).map(n => ({
-            id: n.hash,
-            tr_count: n.tr_count,
-            workchain_id: n.workchain_id,
-            seq_no: n.seq_no,
-            shard: n.shard,
-            gen_utime: n.gen_utime,
-            gen_software_version: n.gen_software_version,
-          }))
-          return { blocks, transactions: [] }
-        }
-
-        const onBatch = (normalized, raw) => {
-          aggregator.ingest(normalized)
-
-          // Always display latest block link using logTemplate
-          let latest = null
-
-          // Prefer normalized blocks list
-          if (normalized && Array.isArray(normalized.blocks) && normalized.blocks.length > 0) {
-            latest = normalized.blocks.reduce((acc, b) => {
-              if (!acc) return b
-              if (typeof b.seq_no === 'number' && typeof acc.seq_no === 'number') {
-                return b.seq_no > acc.seq_no ? b : acc
-              }
-              return b || acc
-            }, null)
-          }
-
-          // Fallback to raw edges if needed
-          if (!latest) {
-            const blocksNode = ((((raw || {}).data || {}).blockchain || {}).blocks) || {}
-            const edges = Array.isArray(blocksNode.edges) ? blocksNode.edges : []
-            if (edges.length > 0) {
-              const latestNode = edges.reduce((acc, e) => {
-                const n = e && e.node
-                if (!n) return acc
-                if (!acc || (typeof n.seq_no === 'number' && n.seq_no > acc.seq_no)) return n
-                return acc
-              }, null)
-              if (latestNode) {
-                latest = {
-                  id: latestNode.hash,
-                  workchain_id: latestNode.workchain_id,
-                  shard: latestNode.shard,
-                  seq_no: latestNode.seq_no,
-                  gen_software_version: latestNode.gen_software_version,
-                }
-              }
-            }
-          }
-
-          if (latest) {
-            log(logTemplate(network, latest))
-          }
-        }
-
-        const onError = (e) => {
-          log(`<span style='color: red'>ERROR:</span> ${e.message || e}`)
-        }
-        startLongPolling({ intervalMs: 1500, fetchOnce, normalize, onBatch, onError, onLog: log })
       }
 
       function blockPollingTonCore(root, network) {
@@ -413,7 +382,7 @@
         switch (network) {
           case 'ackinacki-shellnet':
           case 'ackinacki-mainnet':
-            blockPolling(elem, network)
+            blockPolling(elem, network, graphqlBlockProvider(network))
             break
           case 'ton-main':
           case 'ton-test':
