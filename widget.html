@@ -79,7 +79,8 @@
 </h4>
 <div data-behavior='output'></div>`
         out.updateElem = (name, value) => {
-          out.querySelector(`[data-behavior=${name}]`).innerHTML = value
+          const target = out.querySelector(`[data-behavior=${name}]`)
+          if (target) target.innerHTML = value
         }
         root.append(out)
         return {
@@ -91,16 +92,20 @@
 
       function startLongPolling({ intervalMs = 1500, fetchOnce, normalize, onBatch, onError, onLog }) {
         let stopped = false
+        let delayMs = intervalMs
         async function tick() {
           if (stopped) return
           try {
             const raw = await fetchOnce()
             const normalized = normalize(raw)
             await onBatch(normalized, raw)
+            delayMs = intervalMs
           } catch (e) {
-            if (onError) onError(e)
+            const requestedDelay = onError && await onError(e)
+            if (Number.isFinite(requestedDelay) && requestedDelay > 0) delayMs = requestedDelay
+            else delayMs = intervalMs
           } finally {
-            if (!stopped) setTimeout(tick, intervalMs)
+            if (!stopped) setTimeout(tick, delayMs)
           }
         }
         if (onLog) onLog('Starting long-poll...')
@@ -110,16 +115,18 @@
 
       function createPollingMetricsAggregator(elem, options = {}) {
         const retentionMs = options.retentionMs || 5 * 60 * 1000 // keep ids for 5 minutes
-        let firstBlockTime
-        let lastBlockTime
-        let totalTransactionCount = 0
-        let totalBlockCount = 0
-        const wcTransactionCount = {}
         const seenBlocks = new Map()
+        const metricBlocks = new Map()
+        let latestObservedBlockTime = 0
+        let latestBlockObservedAt
+        const monotonicNow = () => globalThis.performance?.now?.() ?? Date.now()
 
-        function prune(now) {
-          for (const [id, meta] of seenBlocks) {
-            if (now - meta.gen_utime * 1000 > retentionMs) seenBlocks.delete(id)
+        function prune(now, latestBlockTime) {
+          for (const [id, lastSeenAt] of seenBlocks) {
+            if (now - lastSeenAt > retentionMs) seenBlocks.delete(id)
+          }
+          for (const [id, block] of metricBlocks) {
+            if (latestBlockTime - block.gen_utime > retentionMs / 1000) metricBlocks.delete(id)
           }
         }
 
@@ -129,39 +136,49 @@
 
           for (const b of blocks) {
             if (!b || !b.id || typeof b.gen_utime !== 'number') continue
-            
-            if (!seenBlocks.has(b.id)) {
-              seenBlocks.set(b.id, { gen_utime: b.gen_utime, workchain_id: b.workchain_id })
+            const seen = seenBlocks.get(b.id)
+            if (seen) {
+              seenBlocks.set(b.id, now)
+            } else {
+              seenBlocks.set(b.id, now)
               newBlocks += 1
-              
-              // Track time range
-              if (!firstBlockTime || b.gen_utime < firstBlockTime) {
-                firstBlockTime = b.gen_utime
-              }
-              if (!lastBlockTime || b.gen_utime > lastBlockTime) {
-                lastBlockTime = b.gen_utime
-              }
-              
-              if (typeof b.tr_count === 'number') {
-                totalTransactionCount += b.tr_count
-                if (b.workchain_id !== undefined) {
-                  const wc = u8(b.workchain_id)
-                  wcTransactionCount[wc] = (wcTransactionCount[wc] || 0) + b.tr_count
-                }
-              }
+              metricBlocks.set(b.id, b)
             }
           }
 
-          totalBlockCount += newBlocks
-          prune(now)
+          const batchLatestBlockTime = blocks.reduce((latest, block) =>
+            typeof block?.gen_utime === 'number' ? Math.max(latest, block.gen_utime) : latest, 0)
+          if (batchLatestBlockTime > latestObservedBlockTime) {
+            latestObservedBlockTime = batchLatestBlockTime
+            latestBlockObservedAt = monotonicNow()
+          }
+          const elapsedSinceTipMs = latestBlockObservedAt === undefined
+            ? 0
+            : Math.max(0, monotonicNow() - latestBlockObservedAt)
+          prune(now, latestObservedBlockTime + elapsedSinceTipMs / 1000)
 
           // Calculate metrics based on block time range, not client time
-          if (firstBlockTime && lastBlockTime && lastBlockTime > firstBlockTime) {
+          const metricValues = [...metricBlocks.values()]
+          if (metricValues.length > 0) {
+            let firstBlockTime = metricValues[0].gen_utime
+            let lastBlockTime = metricValues[0].gen_utime
+            let totalTransactionCount = 0
+            const wcTransactionCount = {}
+            for (const block of metricValues) {
+              firstBlockTime = Math.min(firstBlockTime, block.gen_utime)
+              lastBlockTime = Math.max(lastBlockTime, block.gen_utime)
+              totalTransactionCount += block.tr_count || 0
+              if (block.workchain_id !== undefined) {
+                const wc = u8(block.workchain_id)
+                wcTransactionCount[wc] = (wcTransactionCount[wc] || 0) + (block.tr_count || 0)
+              }
+            }
+            const totalBlockCount = metricValues.length
             const timeDiffSeconds = lastBlockTime - firstBlockTime
             if (timeDiffSeconds > 1) {
               const BPS = Number(totalBlockCount / timeDiffSeconds)
               const TPS = Number(totalTransactionCount / timeDiffSeconds)
-              const TPSMC = wcTransactionCount['ff'] ? Number(wcTransactionCount['ff'] / timeDiffSeconds) : undefined
+              const TPSMC = wcTransactionCount['ff'] !== undefined ? Number(wcTransactionCount['ff'] / timeDiffSeconds) : undefined
               const TPSWC0 = wcTransactionCount['0'] !== undefined ? Number(wcTransactionCount['0'] / timeDiffSeconds) : undefined
 
               elem.updateElem('bps', `${BPS.toFixed(1)}`)
@@ -171,6 +188,11 @@
                 elem.updateElem('tpsWC0', `${TPSWC0 >= 0 ? TPSWC0.toFixed(2) : '...'}`)
               }
             }
+          } else {
+            elem.updateElem('bps', '0.0')
+            elem.updateElem('tps', '0.0')
+            elem.updateElem('tpsMC', '0.00')
+            elem.updateElem('tpsWC0', '0.00')
           }
 
           return { newBlocks, newTxs: 0 }
@@ -184,87 +206,355 @@
         log(`<span style='color: red'>ERROR:</span> not impliment ${network}`)
       }
 
-      function blockPolling(root, network) {
+      function latestBlock(blocks, field) {
+        return blocks.reduce((latest, block) => !latest || block[field] > latest[field] ? block : latest, null)
+      }
+
+      function blockPolling(root, network, provider) {
         const { elem, log } = createMetric(root, network)
         const aggregator = createPollingMetricsAggregator(elem)
-        const host = graphqlHost(network)
-        const query = `query { blockchain { blocks( last: 500 ) { edges { node { hash seq_no workchain_id shard gen_utime tr_count gen_software_version } cursor } pageInfo{ endCursor } } } }`
-        const makeUrl = () => `https://${host}/graphql?_=_&isBlockChainApiQuery=true&query=${encodeURIComponent(query)}`
-        const fetchOnce = async () => {
-          const res = await fetch(makeUrl(), { method: 'GET', cache: 'no-store' })
-          if (!res.ok) throw new Error(`HTTP ${res.status}`)
-          return res.json()
+        startLongPolling({
+          intervalMs: provider.intervalMs,
+          fetchOnce: provider.fetchOnce,
+          normalize: provider.normalize,
+          onBatch: normalized => {
+            aggregator.ingest(normalized)
+            const latest = provider.onBatch ? provider.onBatch(normalized) : latestBlock(normalized.blocks, provider.latestBy)
+            if (latest) log(logTemplate(network, latest))
+          },
+          onError: async error => {
+            aggregator.ingest({})
+            if (provider.onError) return provider.onError(error, log)
+            log(`<span style='color: red'>ERROR:</span> ${escapeHtml(error.message || error)}`)
+          },
+          onLog: log,
+        })
+      }
+
+      function graphqlBlockProvider(network) {
+        const query = `query { blockchain { blocks( last: 500 ) { edges { node { hash seq_no workchain_id shard gen_utime tr_count gen_software_version } } } } }`
+        const url = `https://${graphqlHost(network)}/graphql?_=_&isBlockChainApiQuery=true&query=${encodeURIComponent(query)}`
+        return {
+          intervalMs: 1500,
+          fetchOnce: async () => {
+            const response = await fetch(url, { method: 'GET', cache: 'no-store' })
+            if (!response.ok) throw new Error(`HTTP ${response.status}`)
+            return response.json()
+          },
+          normalize: response => ({
+            blocks: (response?.data?.blockchain?.blocks?.edges || []).map(edge => edge.node).filter(Boolean).map(node => ({
+              id: node.hash,
+              tr_count: node.tr_count,
+              workchain_id: node.workchain_id,
+              seq_no: node.seq_no,
+              shard: node.shard,
+              gen_utime: node.gen_utime,
+              gen_software_version: node.gen_software_version,
+            })),
+            transactions: [],
+          }),
+          latestBy: 'seq_no',
         }
+      }
 
-        const normalize = (response) => {
-          const edges = (((response || {}).data || {}).blockchain || {}).blocks || {}
-          const list = Array.isArray(edges.edges) ? edges.edges : []
-          const blocks = list.map(e => e && e.node).filter(Boolean).map(n => ({
-            id: n.hash,
-            tr_count: n.tr_count,
-            workchain_id: n.workchain_id,
-            seq_no: n.seq_no,
-            shard: n.shard,
-            gen_utime: n.gen_utime,
-            gen_software_version: n.gen_software_version,
-          }))
-          return { blocks, transactions: [] }
+      function tonApiHost(network) {
+        switch (network) {
+          case 'ton-test':
+            return 'https://testnet.toncenter.com/api/v3'
+          case 'ton-main':
+            return 'https://toncenter.com/api/v3'
+          default:
+            throw new Error(`Unsupported TON network: ${network}`)
         }
+      }
 
-        const onBatch = (normalized, raw) => {
-          aggregator.ingest(normalized)
+      function normalizeTonBlocks(response) {
+        const list = response?.blocks
+        if (!Array.isArray(list)) throw new Error('Invalid TON Center block response')
 
-          // Always display latest block link using logTemplate
-          let latest = null
-
-          // Prefer normalized blocks list
-          if (normalized && Array.isArray(normalized.blocks) && normalized.blocks.length > 0) {
-            latest = normalized.blocks.reduce((acc, b) => {
-              if (!acc) return b
-              if (typeof b.seq_no === 'number' && typeof acc.seq_no === 'number') {
-                return b.seq_no > acc.seq_no ? b : acc
-              }
-              return b || acc
-            }, null)
+        const blocks = list.map(block => {
+          const workchainId = Number(block?.workchain)
+          const transactionCount = Number(block?.tx_count)
+          const seqNo = Number(block?.seqno)
+          const generationTime = Number(block?.gen_utime)
+          const shard = String(block?.shard || '')
+          if (!/^[\da-f]{16}$/i.test(shard)) throw new Error('Invalid TON block shard')
+          if (!Number.isSafeInteger(workchainId) || workchainId < -2147483648 || workchainId > 2147483647 ||
+            !Number.isSafeInteger(transactionCount) || transactionCount < 0 ||
+            !Number.isSafeInteger(seqNo) || seqNo < 0 ||
+            !Number.isSafeInteger(generationTime) || generationTime < 0 || generationTime > 0xffffffff) {
+            throw new Error('Invalid TON block')
           }
+          const normalized = {
+            id: `${workchainId}:${shard}:${seqNo}`,
+            tr_count: transactionCount,
+            workchain_id: workchainId,
+            seq_no: seqNo,
+            shard,
+            gen_utime: generationTime,
+          }
+          if (!Object.values(normalized).every(value => value !== '' && value !== undefined)) {
+            throw new Error('Invalid TON block')
+          }
+          return normalized
+        })
+        return { blocks, transactions: [] }
+      }
 
-          // Fallback to raw edges if needed
-          if (!latest) {
-            const blocksNode = ((((raw || {}).data || {}).blockchain || {}).blocks) || {}
-            const edges = Array.isArray(blocksNode.edges) ? blocksNode.edges : []
-            if (edges.length > 0) {
-              const latestNode = edges.reduce((acc, e) => {
-                const n = e && e.node
-                if (!n) return acc
-                if (!acc || (typeof n.seq_no === 'number' && n.seq_no > acc.seq_no)) return n
-                return acc
-              }, null)
-              if (latestNode) {
-                latest = {
-                  id: latestNode.hash,
-                  workchain_id: latestNode.workchain_id,
-                  shard: latestNode.shard,
-                  seq_no: latestNode.seq_no,
-                  gen_software_version: latestNode.gen_software_version,
-                }
+      function retryAfterMs(value, now = Date.now(), serverDate) {
+        if (!value) return undefined
+        if (/^\d+$/.test(value.trim())) return Math.min(Math.max(Number(value) * 1000, 1000), tonMaxBackoffMs)
+        const retryAt = Date.parse(value)
+        const serverNow = Date.parse(serverDate)
+        const delay = retryAt - (Number.isFinite(serverNow) ? serverNow : now)
+        return Number.isFinite(delay) ? Math.min(Math.max(delay, 1000), tonMaxBackoffMs) : undefined
+      }
+
+      const tonGuestIntervalMs = 10000
+      const tonRequestTimeoutMs = 30000
+      const tonMaxBackoffMs = 300000
+      let tonGuestNotBefore = 0
+      let tonStorageFallbackRetryMs = 30000
+
+      function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char])
+      }
+
+      function createTonRequestScheduler({
+        minIntervalMs = tonGuestIntervalMs,
+        now = () => Date.now(),
+        sleep = (delay) => new Promise(resolve => setTimeout(resolve, delay)),
+        notBefore = () => tonGuestNotBefore,
+      } = {}) {
+        let tail = Promise.resolve()
+        let lastRequestAt
+        return async (request) => {
+          let requestPromise
+          const run = async () => {
+            while (true) {
+              const nextRequestAt = Math.max(
+                lastRequestAt === undefined ? 0 : lastRequestAt + minIntervalMs,
+                notBefore(),
+              )
+              const delay = Math.max(0, nextRequestAt - now())
+              if (delay === 0) break
+              await sleep(delay)
+            }
+            lastRequestAt = now()
+            requestPromise = Promise.resolve().then(request)
+          }
+          const dispatched = tail.then(run, run)
+          tail = dispatched.catch(() => {})
+          return dispatched.then(() => requestPromise)
+        }
+      }
+
+      // The scheduler shares one guest rate limit across mainnet and testnet tabs
+      const scheduleTonRequestLocally = createTonRequestScheduler()
+      const tonGuestSlotKey = 'network-load-ton-guest-last-request-at'
+      const tonGuestNotBeforeKey = 'network-load-ton-guest-not-before'
+      const tonGuestClaimMs = 25
+      const tonStorageFallbackBackoffs = new WeakSet()
+      const wait = (delay) => new Promise(resolve => setTimeout(resolve, delay))
+
+      function readTonGuestSlot() {
+        try {
+          const storage = globalThis.localStorage
+          return {
+            lastRequestAt: Number(String(storage.getItem(tonGuestSlotKey) || '').split(':')[0]) || 0,
+            notBefore: Math.max(tonGuestNotBefore, Number(storage.getItem(tonGuestNotBeforeKey)) || 0),
+          }
+        } catch {
+          return undefined
+        }
+      }
+
+      async function deferTonGuestRequests(delayMs) {
+        const requestedNotBefore = Date.now() + delayMs
+        tonGuestNotBefore = Math.max(tonGuestNotBefore, requestedNotBefore)
+        const update = async (verify) => {
+          try {
+            const storage = globalThis.localStorage
+            while (true) {
+              const notBefore = Math.max(requestedNotBefore, Number(storage.getItem(tonGuestNotBeforeKey)) || 0)
+              storage.setItem(tonGuestNotBeforeKey, String(notBefore))
+              if (!verify) {
+                tonGuestNotBefore = notBefore
+                return true
+              }
+              await wait(tonGuestClaimMs)
+              const stored = Number(storage.getItem(tonGuestNotBeforeKey)) || 0
+              if (stored >= notBefore) {
+                tonGuestNotBefore = stored
+                return true
               }
             }
-          }
-
-          if (latest) {
-            log(logTemplate(network, latest))
+          } catch {
+            // The page-local fallback remains in tonGuestNotBefore
+            return false
           }
         }
+        const locks = globalThis.navigator?.locks
+        if (locks) {
+          const persisted = await locks.request('network-load-ton-guest-slot', () => update())
+          if (!persisted) await locks.request('network-load-ton-guest-slot', () => wait(delayMs))
+        } else await update(true)
+      }
 
-        const onError = (e) => {
-          log(`<span style='color: red'>ERROR:</span> ${e.message || e}`)
+      async function reserveTonGuestSlot(verify) {
+        const slot = readTonGuestSlot()
+        if (!slot) return undefined
+        const remaining = Math.max(slot.lastRequestAt + tonGuestIntervalMs, slot.notBefore) - Date.now()
+        if (remaining > 0) return remaining
+        try {
+          const claim = `${Date.now()}:${Math.random()}`
+          globalThis.localStorage.setItem(tonGuestSlotKey, claim)
+          if (verify) {
+            await wait(tonGuestClaimMs)
+            if (globalThis.localStorage.getItem(tonGuestSlotKey) !== claim) {
+              return Math.max(1, readTonGuestSlot().lastRequestAt + tonGuestIntervalMs - Date.now())
+            }
+          }
+          return 0
+        } catch {
+          return undefined
         }
-        startLongPolling({ intervalMs: 1500, fetchOnce, normalize, onBatch, onError, onLog: log })
+      }
+
+      async function claimTonGuestSlot(locks) {
+        while (true) {
+          const delay = locks
+            ? await locks.request('network-load-ton-guest-slot', () => reserveTonGuestSlot())
+            : await reserveTonGuestSlot(true)
+          if (delay === undefined) return false
+          if (delay <= 0) return
+          await wait(delay)
+        }
+      }
+
+      async function runTonRequestWithoutStorage(locks, request) {
+        let response
+        let failure
+        await locks.request('network-load-ton-guest-slot', async () => {
+          try {
+            response = await request()
+            const retryAfter = response.status === 429 && retryAfterMs(response.headers.get('Retry-After'), Date.now(), response.headers.get('Date'))
+            const backoff = retryAfter || (response.status === 429 ? tonStorageFallbackRetryMs : tonGuestIntervalMs)
+            if (response.status === 429) {
+              tonStorageFallbackBackoffs.add(response)
+              if (!retryAfter) tonStorageFallbackRetryMs = Math.min(tonStorageFallbackRetryMs * 2, 300000)
+            }
+            await wait(backoff)
+          } catch (error) {
+            failure = error
+            await wait(tonGuestIntervalMs)
+          }
+        })
+        if (failure) throw failure
+        return response
+      }
+
+      function scheduleTonRequest(request) {
+        const locks = globalThis.navigator?.locks
+        return scheduleTonRequestLocally(async () => {
+          const claimed = await claimTonGuestSlot(locks)
+          return locks && claimed === false
+            ? runTonRequestWithoutStorage(locks, request)
+            : request()
+        })
+      }
+
+      function tonBlockProvider(network) {
+        const baseUrl = `${tonApiHost(network)}/blocks`
+        const historySeconds = 300
+        let fallbackRetryMs = 30000
+        let latestGenerationTime
+        const fetchPage = async (params) => {
+          let controller
+          let timeout
+          try {
+            const response = await scheduleTonRequest(() => {
+              controller = new AbortController()
+              timeout = setTimeout(() => controller.abort(), tonRequestTimeoutMs)
+              return fetch(`${baseUrl}?${params}`, {
+                method: 'GET',
+                headers: { Accept: 'application/json' },
+                cache: 'no-store',
+                signal: controller.signal,
+              }).then(response => {
+                clearTimeout(timeout)
+                timeout = undefined
+                return response
+              })
+            })
+            if (!response.ok) {
+              const error = new Error(`HTTP ${response.status}`)
+              if (response.status === 429) {
+                error.retryAfterMs = retryAfterMs(response.headers.get('Retry-After'), Date.now(), response.headers.get('Date'))
+                error.guestBackoffApplied = tonStorageFallbackBackoffs.has(response)
+              }
+              throw error
+            }
+            timeout = setTimeout(() => controller.abort(), tonRequestTimeoutMs)
+            return await response.json()
+          } catch (error) {
+            if (controller?.signal.aborted) throw new Error('TON request timed out')
+            throw error
+          } finally {
+            if (timeout) clearTimeout(timeout)
+          }
+        }
+        const fetchOnce = async () => {
+          if (latestGenerationTime === undefined) {
+            return fetchPage('limit=1000&sort=desc')
+          }
+
+          const snapshot = await fetchPage('limit=1&sort=desc')
+          const snapshotBlocks = snapshot?.blocks
+          if (!Array.isArray(snapshotBlocks)) throw new Error('Invalid TON Center block response')
+          if (snapshotBlocks.length === 0) return { blocks: [] }
+          const endUtime = Number(snapshotBlocks[0].gen_utime)
+          let startUtime = Math.max(0, latestGenerationTime - 1, endUtime - historySeconds)
+          if (!Number.isSafeInteger(endUtime) || endUtime < startUtime) {
+            throw new Error('Invalid TON block snapshot')
+          }
+
+          const fetchRange = async (start, end) => {
+            const page = await fetchPage(`start_utime=${start}&end_utime=${end + 1}&limit=1000&sort=desc`)
+            if (!Array.isArray(page?.blocks)) throw new Error('Invalid TON Center block response')
+            if (page.blocks.length < 1000) return page.blocks
+            if (start === end) throw new Error('TON block range exceeds guest request limit')
+            const middle = Math.floor((start + end) / 2)
+            return [...await fetchRange(start, middle), ...await fetchRange(middle + 1, end)]
+          }
+          return { blocks: await fetchRange(startUtime, endUtime) }
+        }
+        return {
+          intervalMs: tonGuestIntervalMs,
+          fetchOnce,
+          normalize: normalizeTonBlocks,
+          onBatch: normalized => {
+            fallbackRetryMs = tonStorageFallbackRetryMs = 30000
+            const latest = latestBlock(normalized.blocks, 'gen_utime')
+            if (latest) latestGenerationTime = Math.max(latestGenerationTime || 0, latest.gen_utime)
+            return latest
+          },
+          onError: async (error, log) => {
+            if (!error.message?.startsWith('HTTP 429')) {
+              log(`<span style='color: red'>ERROR:</span> ${escapeHtml(error.message || error)}`)
+              return
+            }
+            const delay = error.retryAfterMs || fallbackRetryMs
+            if (!error.retryAfterMs) fallbackRetryMs = Math.min(delay * 2, tonMaxBackoffMs)
+            if (!error.guestBackoffApplied) await deferTonGuestRequests(delay)
+            log(`Rate limited; retrying in ${Math.ceil(delay / 1000)}s`)
+            return error.guestBackoffApplied ? 0 : delay
+          },
+        }
       }
 
       function blockPollingTonCore(root, network) {
-        // TODO implement
-        console.log(`${network} not implement`)
+        blockPolling(root, network, tonBlockProvider(network))
       }
 
       function blockSubscriptionEverX(root, network) {
@@ -413,7 +703,7 @@
         switch (network) {
           case 'ackinacki-shellnet':
           case 'ackinacki-mainnet':
-            blockPolling(elem, network)
+            blockPolling(elem, network, graphqlBlockProvider(network))
             break
           case 'ton-main':
           case 'ton-test':
@@ -432,14 +722,14 @@
 
       window.addEventListener('load', function () {
         const root = document.querySelector('[data-behavior=content]')
+        loadWidget(root, 'ton-main')
+        loadWidget(root, 'ton-test')
         loadWidget(root, 'ever-main')
         // loadWidget(root, 'ever-test')
         // loadWidget(root, 'venom-main')
         // loadWidget(root, 'venom-test')
         loadWidget(root, 'ackinacki-mainnet')
         loadWidget(root, 'ackinacki-shellnet')
-        // loadWidget(root, 'ton-main')
-        // loadWidget(root, 'ton-test')
       })
     </script>
 </head>
