@@ -79,7 +79,8 @@
 </h4>
 <div data-behavior='output'></div>`
         out.updateElem = (name, value) => {
-          out.querySelector(`[data-behavior=${name}]`).innerHTML = value
+          const target = out.querySelector(`[data-behavior=${name}]`)
+          if (target) target.innerHTML = value
         }
         root.append(out)
         return {
@@ -91,16 +92,20 @@
 
       function startLongPolling({ intervalMs = 1500, fetchOnce, normalize, onBatch, onError, onLog }) {
         let stopped = false
+        let delayMs = intervalMs
         async function tick() {
           if (stopped) return
           try {
             const raw = await fetchOnce()
             const normalized = normalize(raw)
             await onBatch(normalized, raw)
+            delayMs = intervalMs
           } catch (e) {
-            if (onError) onError(e)
+            const requestedDelay = onError && await onError(e)
+            if (Number.isFinite(requestedDelay) && requestedDelay >= 0) delayMs = requestedDelay
+            else delayMs = intervalMs
           } finally {
-            if (!stopped) setTimeout(tick, intervalMs)
+            if (!stopped) setTimeout(tick, delayMs)
           }
         }
         if (onLog) onLog('Starting long-poll...')
@@ -110,73 +115,126 @@
 
       function createPollingMetricsAggregator(elem, options = {}) {
         const retentionMs = options.retentionMs || 5 * 60 * 1000 // keep ids for 5 minutes
-        let firstBlockTime
-        let lastBlockTime
-        let totalTransactionCount = 0
-        let totalBlockCount = 0
-        const wcTransactionCount = {}
         const seenBlocks = new Map()
+        const metricBlocks = new Map()
+        const blockCoordinates = new Map()
+        let latestObservedBlockTime = 0
+        let latestBlockObservedAt
+        const monotonicNow = () => globalThis.performance?.now?.() ?? Date.now()
 
-        function prune(now) {
-          for (const [id, meta] of seenBlocks) {
-            if (now - meta.gen_utime * 1000 > retentionMs) seenBlocks.delete(id)
+        function prune(now, latestBlockTime) {
+          for (const [id, lastSeenAt] of seenBlocks) {
+            if (now - lastSeenAt > retentionMs) seenBlocks.delete(id)
+          }
+          for (const [id, block] of metricBlocks) {
+            if (latestBlockTime - block.gen_utime > retentionMs / 1000) {
+              metricBlocks.delete(id)
+              if (blockCoordinates.get(block.coordinate || id) === id) blockCoordinates.delete(block.coordinate || id)
+            }
           }
         }
 
-        function ingest({ blocks = [], transactions = [] }) {
+        function ingest({ blocks = [], transactions = [], serverTime, serverObservedAt }) {
           const now = Date.now()
           let newBlocks = 0
+          const batchLatestBlockTime = blocks.reduce((latest, block) =>
+            typeof block?.gen_utime === 'number' ? Math.max(latest, block.gen_utime) : latest, 0)
+
+          // Each successful TON poll is a window snapshot. If its tip moves
+          // backwards, discard the previous branch before ingesting the snapshot.
+          if (batchLatestBlockTime > 0 && batchLatestBlockTime < latestObservedBlockTime) {
+            seenBlocks.clear()
+            metricBlocks.clear()
+            blockCoordinates.clear()
+            latestObservedBlockTime = 0
+            latestBlockObservedAt = undefined
+          }
 
           for (const b of blocks) {
             if (!b || !b.id || typeof b.gen_utime !== 'number') continue
-            
-            if (!seenBlocks.has(b.id)) {
-              seenBlocks.set(b.id, { gen_utime: b.gen_utime, workchain_id: b.workchain_id })
+            const coordinate = b.coordinate || b.id
+            const previousId = blockCoordinates.get(coordinate)
+            if (previousId && previousId !== b.id) {
+              seenBlocks.delete(previousId)
+              metricBlocks.delete(previousId)
+            }
+            blockCoordinates.set(coordinate, b.id)
+            const seen = seenBlocks.get(b.id)
+            if (seen) {
+              seenBlocks.set(b.id, now)
+            } else {
+              seenBlocks.set(b.id, now)
               newBlocks += 1
-              
-              // Track time range
-              if (!firstBlockTime || b.gen_utime < firstBlockTime) {
-                firstBlockTime = b.gen_utime
-              }
-              if (!lastBlockTime || b.gen_utime > lastBlockTime) {
-                lastBlockTime = b.gen_utime
-              }
-              
-              if (typeof b.tr_count === 'number') {
-                totalTransactionCount += b.tr_count
-                if (b.workchain_id !== undefined) {
-                  const wc = u8(b.workchain_id)
-                  wcTransactionCount[wc] = (wcTransactionCount[wc] || 0) + b.tr_count
-                }
-              }
+              metricBlocks.set(b.id, b)
             }
           }
 
-          totalBlockCount += newBlocks
-          prune(now)
+          if (batchLatestBlockTime > latestObservedBlockTime) {
+            latestObservedBlockTime = batchLatestBlockTime
+            const elapsedSinceServerSnapshotMs = Number.isFinite(serverObservedAt)
+              ? Math.max(0, monotonicNow() - serverObservedAt)
+              : 0
+            const tipAgeMs = Number.isFinite(serverTime)
+              ? Math.max(0, serverTime - batchLatestBlockTime * 1000) + elapsedSinceServerSnapshotMs
+              : 0
+            latestBlockObservedAt = monotonicNow() - tipAgeMs
+          }
+          const elapsedSinceTipMs = latestBlockObservedAt === undefined
+            ? 0
+            : Math.max(0, monotonicNow() - latestBlockObservedAt)
+          prune(now, latestObservedBlockTime + elapsedSinceTipMs / 1000)
 
           // Calculate metrics based on block time range, not client time
-          if (firstBlockTime && lastBlockTime && lastBlockTime > firstBlockTime) {
+          const metricValues = [...metricBlocks.values()]
+          if (metricValues.length > 0) {
+            let firstBlockTime = metricValues[0].gen_utime
+            let lastBlockTime = metricValues[0].gen_utime
+            let totalTransactionCount = 0
+            const wcTransactionCount = {}
+            for (const block of metricValues) {
+              firstBlockTime = Math.min(firstBlockTime, block.gen_utime)
+              lastBlockTime = Math.max(lastBlockTime, block.gen_utime)
+              totalTransactionCount += block.tr_count || 0
+              if (block.workchain_id !== undefined) {
+                const wc = u8(block.workchain_id)
+                wcTransactionCount[wc] = (wcTransactionCount[wc] || 0) + (block.tr_count || 0)
+              }
+            }
+            const totalBlockCount = metricValues.length
             const timeDiffSeconds = lastBlockTime - firstBlockTime
             if (timeDiffSeconds > 1) {
               const BPS = Number(totalBlockCount / timeDiffSeconds)
               const TPS = Number(totalTransactionCount / timeDiffSeconds)
-              const TPSMC = wcTransactionCount['ff'] ? Number(wcTransactionCount['ff'] / timeDiffSeconds) : undefined
-              const TPSWC0 = wcTransactionCount['0'] !== undefined ? Number(wcTransactionCount['0'] / timeDiffSeconds) : undefined
+              const TPSMC = Number((wcTransactionCount['ff'] || 0) / timeDiffSeconds)
+              const TPSWC0 = Number((wcTransactionCount['0'] || 0) / timeDiffSeconds)
 
               elem.updateElem('bps', `${BPS.toFixed(1)}`)
               elem.updateElem('tps', `${TPS.toFixed(1)}`)
-              if (TPSMC !== undefined) {
-                elem.updateElem('tpsMC', `${TPSMC.toFixed(2)}`)
-                elem.updateElem('tpsWC0', `${TPSWC0 >= 0 ? TPSWC0.toFixed(2) : '...'}`)
-              }
+              elem.updateElem('tpsMC', `${TPSMC.toFixed(2)}`)
+              elem.updateElem('tpsWC0', `${TPSWC0.toFixed(2)}`)
+            } else {
+              elem.updateElem('bps', '0.0')
+              elem.updateElem('tps', '0.0')
+              elem.updateElem('tpsMC', '0.00')
+              elem.updateElem('tpsWC0', '0.00')
             }
+          } else {
+            elem.updateElem('bps', '0.0')
+            elem.updateElem('tps', '0.0')
+            elem.updateElem('tpsMC', '0.00')
+            elem.updateElem('tpsWC0', '0.00')
           }
 
           return { newBlocks, newTxs: 0 }
         }
 
-        return { ingest }
+        function nextMetricExpiryDelayMs() {
+          return latestBlockObservedAt === undefined
+            ? undefined
+            : Math.max(0, retentionMs - (monotonicNow() - latestBlockObservedAt))
+        }
+
+        return { ingest, nextMetricExpiryDelayMs }
       }
 
       function notImplemented(root, network) {
@@ -191,16 +249,38 @@
       function blockPolling(root, network, provider) {
         const { elem, log } = createMetric(root, network)
         const aggregator = createPollingMetricsAggregator(elem)
+        let metricAgingTimer
+        const scheduleMetricAging = (delay) => {
+          const expiryDelay = aggregator.nextMetricExpiryDelayMs()
+          if (!Number.isFinite(delay) || delay <= expiryDelay || expiryDelay <= 0) return
+          if (metricAgingTimer) clearTimeout(metricAgingTimer)
+          metricAgingTimer = setTimeout(() => aggregator.ingest({}), expiryDelay)
+        }
+        if (provider.onWait) provider.onWait(scheduleMetricAging)
         startLongPolling({
           intervalMs: provider.intervalMs,
           fetchOnce: provider.fetchOnce,
           normalize: provider.normalize,
           onBatch: normalized => {
+            if (metricAgingTimer) clearTimeout(metricAgingTimer)
             aggregator.ingest(normalized)
             const latest = provider.onBatch ? provider.onBatch(normalized) : latestBlock(normalized.blocks, provider.latestBy)
             if (latest) log(logTemplate(network, latest))
           },
-          onError: error => log(`<span style='color: red'>ERROR:</span> ${error.message || error}`),
+          onError: async error => {
+            if (metricAgingTimer) clearTimeout(metricAgingTimer)
+            aggregator.ingest({})
+            if (provider.onError) {
+              const delay = await provider.onError(error, log)
+              const appliedDelay = Math.max(
+                Number.isFinite(delay) ? delay : 0,
+                Number.isFinite(error.retryAfterMs) ? error.retryAfterMs : 0,
+              )
+              scheduleMetricAging(appliedDelay)
+              return delay
+            }
+            log(`<span style='color: red'>ERROR:</span> ${escapeHtml(error.message || error)}`)
+          },
           onLog: log,
         })
       }
@@ -231,9 +311,303 @@
         }
       }
 
+      function tonApiHost(network) {
+        switch (network) {
+          case 'ton-test':
+            return 'https://testnet.toncenter.com/api/v3'
+          case 'ton-main':
+            return 'https://toncenter.com/api/v3'
+          default:
+            throw new Error(`Unsupported TON network: ${network}`)
+        }
+      }
+
+      function parseTonInteger(value) {
+        if (typeof value === 'number') return Number.isSafeInteger(value) ? value : undefined
+        if (typeof value !== 'string' || !/^-?(?:0|[1-9]\d*)$/.test(value)) return undefined
+        const parsed = Number(value)
+        return Number.isSafeInteger(parsed) ? parsed : undefined
+      }
+
+      function parseTonHash(value) {
+        if (typeof value !== 'string') return undefined
+        if (/^[\da-f]{64}$/i.test(value) || /^[A-Za-z0-9+/]{43}=$/.test(value)) return value
+        return undefined
+      }
+
+      function normalizeTonBlocks(response) {
+        const list = response?.blocks
+        if (!Array.isArray(list)) throw new Error('Invalid TON Center block response')
+
+        const blocks = list.map(block => {
+          const workchainId = parseTonInteger(block?.workchain)
+          const transactionCount = parseTonInteger(block?.tx_count)
+          const seqNo = parseTonInteger(block?.seqno)
+          const generationTime = parseTonInteger(block?.gen_utime)
+          const shard = String(block?.shard || '')
+          const rootHash = parseTonHash(block?.root_hash)
+          const fileHash = parseTonHash(block?.file_hash)
+          if (!/^[\da-f]{16}$/i.test(shard)) throw new Error('Invalid TON block shard')
+          if (!rootHash || !fileHash) {
+            throw new Error('Invalid TON block hash')
+          }
+          if (!Number.isSafeInteger(workchainId) || workchainId < -2147483648 || workchainId > 2147483647 ||
+            !Number.isSafeInteger(transactionCount) || transactionCount < 0 ||
+            !Number.isSafeInteger(seqNo) || seqNo < 0 ||
+            !Number.isSafeInteger(generationTime) || generationTime < 0 || generationTime > 0xffffffff) {
+            throw new Error('Invalid TON block')
+          }
+          const normalized = {
+            id: `${workchainId}:${shard}:${seqNo}:${rootHash}:${fileHash}`,
+            coordinate: `${workchainId}:${shard}:${seqNo}`,
+            tr_count: transactionCount,
+            workchain_id: workchainId,
+            seq_no: seqNo,
+            shard,
+            gen_utime: generationTime,
+          }
+          if (!Object.values(normalized).every(value => value !== '' && value !== undefined)) {
+            throw new Error('Invalid TON block')
+          }
+          return normalized
+        })
+        return {
+          blocks,
+          transactions: [],
+          serverTime: response?.serverTime,
+          serverObservedAt: response?.serverObservedAt,
+        }
+      }
+
+      function retryAfterMs(value, now = Date.now(), serverDate) {
+        if (!value) return undefined
+        if (/^\d+$/.test(value.trim())) {
+          const delay = Number(value) * 1000
+          return Number.isFinite(delay) ? Math.max(delay, 1000) : undefined
+        }
+        const retryAt = Date.parse(value)
+        const serverNow = Date.parse(serverDate)
+        const delay = retryAt - (Number.isFinite(serverNow) ? serverNow : now)
+        return Number.isFinite(delay) ? Math.max(delay, 1000) : undefined
+      }
+
+      const tonGuestIntervalMs = 10000
+      const tonRequestTimeoutMs = 30000
+      const tonMaxBackoffMs = 300000
+
+      function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char])
+      }
+
+      function createTonRequestScheduler({
+        minIntervalMs = tonGuestIntervalMs,
+        now = () => Date.now(),
+        sleep = (delay) => new Promise(resolve => setTimeout(resolve, delay)),
+        onWait = () => {},
+      } = {}) {
+        let tail = Promise.resolve()
+        let lastRequestAt
+        return async (request) => {
+          const run = async () => {
+            while (true) {
+              const nextRequestAt = Math.max(
+                lastRequestAt === undefined ? 0 : lastRequestAt + minIntervalMs,
+              )
+              const delay = Math.max(0, nextRequestAt - now())
+              if (delay === 0) break
+              onWait(delay)
+              await sleep(delay)
+            }
+            lastRequestAt = now()
+            return request()
+          }
+          const dispatched = tail.then(run, run)
+          tail = dispatched.catch(() => {})
+          return dispatched
+        }
+      }
+
+      const tonGuestNextRequestKey = 'network-load-ton-guest-next-request-at'
+      const tonGuestBackoffs = new WeakMap()
+      const tonWaitListeners = new Set()
+      const maxTimerDelayMs = 2 ** 31 - 1
+
+      async function wait(delay) {
+        const deadline = Date.now() + delay
+        while (true) {
+          const remaining = deadline - Date.now()
+          if (remaining <= 0) return
+          await new Promise(resolve => setTimeout(resolve, Math.min(remaining, maxTimerDelayMs)))
+        }
+      }
+
+      function notifyTonWait(delay) {
+        for (const listener of tonWaitListeners) listener(delay)
+      }
+
+      // The scheduler shares one guest rate limit between networks in this page.
+      const scheduleTonRequestLocally = createTonRequestScheduler({ onWait: notifyTonWait })
+
+      async function reserveTonGuestSlot(locks) {
+        try {
+          while (true) {
+            const delay = await locks.request('network-load-ton-guest-slot', () => {
+              const now = Date.now()
+              const nextRequestAt = Number(globalThis.localStorage.getItem(tonGuestNextRequestKey)) || 0
+              if (nextRequestAt > now) return nextRequestAt - now
+              globalThis.localStorage.setItem(tonGuestNextRequestKey, String(now + tonGuestIntervalMs))
+              return 0
+            })
+            if (delay <= 0) return true
+            notifyTonWait(delay)
+            await wait(delay)
+          }
+        } catch {
+          return false
+        }
+      }
+
+      async function deferTonGuestRequests(locks, delay) {
+        try {
+          await locks.request('network-load-ton-guest-slot', () => {
+            const nextRequestAt = Number(globalThis.localStorage.getItem(tonGuestNextRequestKey)) || 0
+            globalThis.localStorage.setItem(tonGuestNextRequestKey, String(Math.max(nextRequestAt, Date.now() + delay)))
+          })
+        } catch {
+          // Page-local scheduling remains active when persistent storage is unavailable.
+        }
+      }
+
+      async function runTonGuestRequest(request, fallback) {
+        const response = await request()
+        if (response.status === 429) {
+          const retryAfter = retryAfterMs(response.headers.get('Retry-After'), Date.now(), response.headers.get('Date'))
+          const backoff = Math.max(tonGuestIntervalMs, retryAfter || fallback.retryMs)
+          tonGuestBackoffs.set(response, backoff)
+          notifyTonWait(backoff)
+          if (!retryAfter) fallback.retryMs = Math.min(fallback.retryMs * 2, tonMaxBackoffMs)
+        }
+        return response
+      }
+
+      function scheduleTonRequest(request, fallback) {
+        const locks = globalThis.navigator?.locks
+        const runLocally = async () => {
+          const response = await runTonGuestRequest(request, fallback)
+          const backoff = tonGuestBackoffs.get(response)
+          if (backoff) await wait(backoff)
+          return response
+        }
+        if (!locks) return scheduleTonRequestLocally(runLocally)
+        return (async () => {
+          if (!await reserveTonGuestSlot(locks)) return scheduleTonRequestLocally(runLocally)
+          const response = await runTonGuestRequest(request, fallback)
+          const backoff = tonGuestBackoffs.get(response)
+          if (backoff) await deferTonGuestRequests(locks, backoff)
+          return response
+        })()
+      }
+
+      function tonBlockProvider(network) {
+        const baseUrl = `${tonApiHost(network)}/blocks`
+        const historySeconds = 300
+        const guestFallback = { retryMs: 30000 }
+        let latestGenerationTime
+        const fetchPage = async (params) => {
+          let controller
+          let timeout
+          try {
+            const response = await scheduleTonRequest(() => {
+              controller = new AbortController()
+              timeout = setTimeout(() => controller.abort(), tonRequestTimeoutMs)
+              return fetch(`${baseUrl}?${params}`, {
+                method: 'GET',
+                headers: { Accept: 'application/json' },
+                cache: 'no-store',
+                signal: controller.signal,
+              }).then(response => {
+                clearTimeout(timeout)
+                timeout = undefined
+                return response
+              })
+            }, guestFallback)
+            if (!response.ok) {
+              const error = new Error(`HTTP ${response.status}`)
+              if (response.status === 429) {
+                error.retryAfterMs = tonGuestBackoffs.get(response)
+                error.guestBackoffApplied = tonGuestBackoffs.has(response)
+              }
+              throw error
+            }
+            guestFallback.retryMs = 30000
+            timeout = setTimeout(() => controller.abort(), tonRequestTimeoutMs)
+            const body = await response.json()
+            const serverTime = Date.parse(response.headers.get('Date'))
+            const serverObservedAt = globalThis.performance?.now?.()
+            return Number.isFinite(serverTime) ? { ...body, serverTime, serverObservedAt } : body
+          } catch (error) {
+            if (controller?.signal.aborted) throw new Error('TON request timed out')
+            throw error
+          } finally {
+            if (timeout) clearTimeout(timeout)
+          }
+        }
+        const fetchOnce = async () => {
+          if (latestGenerationTime === undefined) {
+            return fetchPage('limit=1000&sort=desc')
+          }
+
+          const snapshot = await fetchPage('limit=1&sort=desc')
+          const snapshotBlocks = snapshot?.blocks
+          if (!Array.isArray(snapshotBlocks)) throw new Error('Invalid TON Center block response')
+          if (snapshotBlocks.length === 0) return { blocks: [] }
+          const endUtime = Number(snapshotBlocks[0].gen_utime)
+          // Re-read the retained metric window: TON Center can index an older block
+          // after a newer generation time has already been observed.
+          let startUtime = Math.max(0, endUtime - historySeconds)
+          if (!Number.isSafeInteger(endUtime) || endUtime < startUtime) {
+            throw new Error('Invalid TON block snapshot')
+          }
+
+          const fetchRange = async (start, end) => {
+            const page = await fetchPage(`start_utime=${start}&end_utime=${end}&limit=1000&sort=desc`)
+            if (!Array.isArray(page?.blocks)) throw new Error('Invalid TON Center block response')
+            if (page.blocks.length < 1000) return page.blocks
+            if (end <= start) throw new Error('TON block range exceeds guest request limit')
+            const middle = Math.floor((start + end) / 2)
+            return [...await fetchRange(start, middle), ...await fetchRange(middle + 1, end)]
+          }
+          return {
+            blocks: await fetchRange(startUtime, endUtime),
+            serverTime: snapshot.serverTime,
+            serverObservedAt: snapshot.serverObservedAt,
+          }
+        }
+        return {
+          intervalMs: tonGuestIntervalMs,
+          onWait: listener => tonWaitListeners.add(listener),
+          fetchOnce,
+          normalize: normalizeTonBlocks,
+          onBatch: normalized => {
+            guestFallback.retryMs = 30000
+            const latest = latestBlock(normalized.blocks, 'gen_utime')
+            if (latest) latestGenerationTime = Math.max(latestGenerationTime || 0, latest.gen_utime)
+            return latest
+          },
+          onError: async (error, log) => {
+            if (!error.message?.startsWith('HTTP 429')) {
+              log(`<span style='color: red'>ERROR:</span> ${escapeHtml(error.message || error)}`)
+              return
+            }
+            const delay = error.retryAfterMs || tonGuestIntervalMs
+            log(`Rate limited; retrying in ${Math.ceil(delay / 1000)}s`)
+            return error.guestBackoffApplied ? 0 : delay
+          },
+        }
+      }
+
       function blockPollingTonCore(root, network) {
-        // TODO implement
-        console.log(`${network} not implement`)
+        blockPolling(root, network, tonBlockProvider(network))
       }
 
       function blockSubscriptionEverX(root, network) {
@@ -401,14 +775,14 @@
 
       window.addEventListener('load', function () {
         const root = document.querySelector('[data-behavior=content]')
+        loadWidget(root, 'ton-main')
+        loadWidget(root, 'ton-test')
         loadWidget(root, 'ever-main')
         // loadWidget(root, 'ever-test')
         // loadWidget(root, 'venom-main')
         // loadWidget(root, 'venom-test')
         loadWidget(root, 'ackinacki-mainnet')
         loadWidget(root, 'ackinacki-shellnet')
-        // loadWidget(root, 'ton-main')
-        // loadWidget(root, 'ton-test')
       })
     </script>
 </head>
