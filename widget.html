@@ -379,6 +379,46 @@
         }
       }
 
+      function normalizeTychoBlocks(response) {
+        const list = response?.blocks
+        if (!Array.isArray(list)) throw new Error('Invalid Tycho block response')
+
+        return {
+          blocks: list.map(block => {
+            const workchainId = parseTonInteger(block?.workchain)
+            const transactionCount = parseTonInteger(block?.transactionCount)
+            const seqNo = parseTonInteger(block?.seqno)
+            const generationTime = parseTonInteger(block?.genUtime)
+            const shard = String(block?.shard || '')
+            const rootHash = typeof block?.rootHash === 'string' && /^[\da-f]{64}$/i.test(block.rootHash)
+              ? block.rootHash
+              : undefined
+            if (!/^[\da-f]{16}$/i.test(shard) || !rootHash ||
+              !Number.isSafeInteger(workchainId) || workchainId < -2147483648 || workchainId > 2147483647 ||
+              !Number.isSafeInteger(transactionCount) || transactionCount < 0 ||
+              !Number.isSafeInteger(seqNo) || seqNo < 0 ||
+              !Number.isSafeInteger(generationTime) || generationTime < 0 || generationTime > 0xffffffff) {
+              throw new Error('Invalid Tycho block')
+            }
+            const normalized = {
+              id: rootHash,
+              coordinate: `${workchainId}:${shard}:${seqNo}`,
+              tr_count: transactionCount,
+              workchain_id: workchainId,
+              seq_no: seqNo,
+              shard,
+              gen_utime: generationTime,
+            }
+            const softwareVersion = parseTonInteger(block?.genSoftwareVersion)
+            if (Number.isSafeInteger(softwareVersion) && softwareVersion >= 0) {
+              normalized.gen_software_version = softwareVersion
+            }
+            return normalized
+          }),
+          transactions: [],
+        }
+      }
+
       function retryAfterMs(value, now = Date.now(), serverDate) {
         if (!value) return undefined
         if (/^\d+$/.test(value.trim())) {
@@ -610,6 +650,25 @@
         blockPolling(root, network, tonBlockProvider(network))
       }
 
+      function tychoBlockProvider() {
+        const url = 'https://api-testnet.tychoprotocol.com/v1/blocks/list'
+        return {
+          intervalMs: 1500,
+          fetchOnce: async () => {
+            const response = await fetch(url, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ limit: 1000 }),
+              cache: 'no-store',
+            })
+            if (!response.ok) throw new Error(`HTTP ${response.status}`)
+            return response.json()
+          },
+          normalize: normalizeTychoBlocks,
+          latestBy: 'gen_utime',
+        }
+      }
+
       function blockSubscriptionEverX(root, network) {
         const query = 'subscription {blocks {id tr_count workchain_id seq_no shard gen_software_version}}'
         const {up, log} = createMetric(root, network)
@@ -696,6 +755,8 @@
             return `https://tonscan.org/block/${block.workchain_id}:${block.shard}:${block.seq_no}`
           case 'ton-test':
             return `https://testnet.tonscan.org/block/${block.workchain_id}:${block.shard}:${block.seq_no}`
+          case 'tycho-test':
+            return `https://testnet.tychoprotocol.com/blocks/${block.id}`
           default:
             return null
         }
@@ -747,6 +808,8 @@
             return 'TON Mainnet'
           case 'ton-test':
             return 'TON Testnet'
+          case 'tycho-test':
+            return 'Tycho Testnet'
           default:
             return network
         }
@@ -761,6 +824,9 @@
           case 'ton-main':
           case 'ton-test':
             blockPollingTonCore(elem, network)
+            break
+          case 'tycho-test':
+            blockPolling(elem, network, tychoBlockProvider())
             break
           case 'ever-main':
           case 'ever-test':
@@ -783,6 +849,7 @@
         // loadWidget(root, 'venom-test')
         loadWidget(root, 'ackinacki-mainnet')
         // loadWidget(root, 'ackinacki-shellnet')
+        loadWidget(root, 'tycho-test')
       })
     </script>
 </head>
